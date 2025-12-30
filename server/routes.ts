@@ -87,6 +87,9 @@ Explanation: [Brief explanation of why these complexities were determined]`;
         data?.candidates?.[0]?.content?.parts?.[0]?.text ??
         data?.text ??
         "";
+      
+      //DEBUG
+      console.log("🔍 RAW_AI_OUTPUT:", text);  // DEBUG — REMOVE LATER
 
       // ===== STRONG PARSER FOR AI OUTPUT =====
       const clean = text
