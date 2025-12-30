@@ -8,9 +8,9 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 // 🔥 health check route required for Render
-app.get("/", (_req, res) => {
-  res.send("AI Code Analyzer Backend Running");
-});
+// app.get("/", (_req, res) => {
+//   res.send("AI Code Analyzer Backend Running");
+// });
 
 
 app.use((req, res, next) => {
