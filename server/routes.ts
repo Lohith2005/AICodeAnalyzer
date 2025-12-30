@@ -3,9 +3,9 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { analyzeCodeSchema, type AnalysisResult } from "@shared/schema";
 
-// simple in-memory rate limiter
+// simple rate limiter
 let lastAnalysisAt = 0;
-const RATE_LIMIT_MS = 3000; // 3 seconds
+const RATE_LIMIT_MS = 3000;
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -14,63 +14,55 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const now = Date.now();
       if (now - lastAnalysisAt < RATE_LIMIT_MS) {
-        return res.status(429).json({
-          message: "Please wait a moment before analyzing again."
-        });
+        return res.status(429).json({ message: "Please wait before analyzing again." });
       }
       lastAnalysisAt = now;
 
       const { code, language } = analyzeCodeSchema.parse(req.body);
-
-      if (!apiKey) {
-        return res.status(400).json({
-          message: "Gemini API key not configured. Add GEMINI_API_KEY in .env"
-        });
-      }
+      if (!apiKey) return res.status(400).json({ message: "API key missing" });
 
       // check if already analyzed
       const existing = await storage.findByCode?.(code);
       if (existing) {
-        const existingResult: AnalysisResult = {
+        return res.json({
           linesOfCode: existing.linesOfCode,
           timeComplexity: existing.timeComplexity,
           spaceComplexity: existing.spaceComplexity,
           explanation: existing.explanation
-        };
-        return res.json(existingResult);
+        });
       }
 
       // count meaningful lines
-      const lines = code.split("\n");
-      const nonEmptyLines = lines.filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return false;
-        if (trimmed.startsWith("//")) return false;
-        if (trimmed.startsWith("#")) return false;
-        if (trimmed.startsWith("/*")) return false;
-        if (trimmed.startsWith("*")) return false;
-        if (trimmed.startsWith("*/")) return false;
-        return true;
-      });
-      const linesOfCode = nonEmptyLines.length;
+      const linesOfCode = code
+        .split("\n")
+        .filter((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return false;
+          if (trimmed.startsWith("//")) return false;
+          if (trimmed.startsWith("#")) return false;
+          if (trimmed.startsWith("/*")) return false;
+          if (trimmed.startsWith("*")) return false;
+          if (trimmed.startsWith("*/")) return false;
+          return true;
+        }).length;
 
-      // ===== PROMPT (your original one) =====
-      const prompt = `Analyze the following ${language} code and provide:
-1. Time Complexity in Big-O notation
-2. Space Complexity in Big-O notation
-3. Brief explanation of the complexity analysis
+      // ---- JSON PROMPT (stable output) ----
+      const prompt = `Analyze the following ${language} code and ONLY return JSON.
+No markdown. No explanation text before or after. ONLY JSON.
+
+Required:
+{
+  "timeComplexity": "O(...)",
+  "spaceComplexity": "O(...)",
+  "explanation": "..."
+}
 
 Code:
 \`\`\`${language}
 ${code}
-\`\`\`
+\`\`\``;
 
-Please respond in this exact format:
-Time Complexity: O(...)
-Space Complexity: O(...)
-Explanation: [Brief explanation of why these complexities were determined]`;
-
-      // ===== CALL GOOGLE GEMINI (REST API) =====
+      // ---- REST CALL ----
       const responseAI = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
         {
@@ -83,35 +75,22 @@ Explanation: [Brief explanation of why these complexities were determined]`;
       );
 
       const data = await responseAI.json();
-      const text =
-        data?.candidates?.[0]?.content?.parts?.[0]?.text ??
-        data?.text ??
-        "";
-      
-      //DEBUG
-      console.log("🔍 RAW_AI_OUTPUT:", text);  // DEBUG — REMOVE LATER
+      let text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-      // ===== STRONG PARSER FOR AI OUTPUT =====
-      const clean = text
-        .replace(/```/g, "")
-        .replace(/\r?\n|\r/g, " ")
-        .trim();
-
-      let timeComplexity = "O(?)";
-      let spaceComplexity = "O(?)";
-      let explanation = "Analysis completed using AI.";
-
+      // normalize + parse JSON
+      text = text.replace(/```json|```/g, "").trim();
+      let parsed: any = {};
       try {
-        const timeMatch = clean.match(/Time Complexity:\s*(O\([^)\]]+\))/i);
-        const spaceMatch = clean.match(/Space Complexity:\s*(O\([^)\]]+\))/i);
-        const explMatch = clean.match(/Explanation:\s*(.+?)(?:$|\s{2,})/i);
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = {};
+      }
 
-        if (timeMatch) timeComplexity = timeMatch[1];
-        if (spaceMatch) spaceComplexity = spaceMatch[1];
-        if (explMatch) explanation = explMatch[1].trim();
-      } catch {}
+      const timeComplexity = parsed.timeComplexity ?? "O(?)";
+      const spaceComplexity = parsed.spaceComplexity ?? "O(?)";
+      const explanation = parsed.explanation ?? "Analysis unavailable";
 
-      // ===== SAVE TO DB =====
+      // save
       await storage.createAnalysis({
         code,
         language,
@@ -121,25 +100,22 @@ Explanation: [Brief explanation of why these complexities were determined]`;
         explanation,
       });
 
-      // ===== SEND RESULT =====
-      const response: AnalysisResult = {
+      // send result
+      const result: AnalysisResult = {
         linesOfCode,
         timeComplexity,
         spaceComplexity,
         explanation,
       };
+      res.json(result);
 
-      res.json(response);
-
-    } catch (error) {
-      console.error("Analysis error:", error);
-      return res.status(500).json({
-        message: "Failed to analyze code. Please try again."
-      });
+    } catch (err) {
+      console.error("Analysis error:", err);
+      res.status(500).json({ message: "Failed to analyze" });
     }
   });
 
-  // Return last 10 analyses
+  // return recent
   app.get("/api/analyses", async (_req, res) => {
     try {
       const list = await storage.getRecentAnalyses(10);
