@@ -2,38 +2,28 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { analyzeCodeSchema, type AnalysisResult } from "@shared/schema";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
-const genAI = new GoogleGenerativeAI(
-  process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || ""
-);
-
-// cheaper model = flash-lite
-// const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-   const model = genAI.getGenerativeModel({ model: "gemini-pro" });
-
-// simple in-memory rate limiter
-let lastAnalysisAt = 0;
-const RATE_LIMIT_MS = 3000; // 3 seconds
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+
+  // simple in-memory rate limiter
+  let lastAnalysisAt = 0;
+  const RATE_LIMIT_MS = 3000;
+
   app.post("/api/analyze", async (req, res) => {
     try {
       const now = Date.now();
       if (now - lastAnalysisAt < RATE_LIMIT_MS) {
-        return res.status(429).json({ message: "Please wait a moment before analyzing again." });
+        return res.status(429).json({ message: "Please wait before analyzing again." });
       }
       lastAnalysisAt = now;
 
       const { code, language } = analyzeCodeSchema.parse(req.body);
-
-      if (!process.env.GEMINI_API_KEY && !process.env.GOOGLE_API_KEY) {
-        return res.status(400).json({
-          message: "Gemini API key not configured. Add GEMINI_API_KEY in .env"
-        });
+      if (!apiKey) {
+        return res.status(400).json({ message: "Gemini API key is missing" });
       }
 
-      // check if we've already analyzed this exact code
+      // check if previously analyzed (avoid burning quota)
       const existing = await storage.findByCode?.(code);
       if (existing) {
         const existingResult: AnalysisResult = {
@@ -45,18 +35,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json(existingResult);
       }
 
-      const lines = code.split("\n");
-      const nonEmptyLines = lines.filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return false;
-        if (trimmed.startsWith("//")) return false;
-        if (trimmed.startsWith("#")) return false;
-        if (trimmed.startsWith("/*")) return false;
-        if (trimmed.startsWith("*")) return false;
-        if (trimmed.startsWith("*/")) return false;
-        return true;
-      });
-      const linesOfCode = nonEmptyLines.length;
+      const linesOfCode = code
+        .split("\n")
+        .filter((line) => line.trim() && !line.trim().startsWith("//"))
+        .length;
 
       const prompt = `Analyze the following ${language} code and provide:
 1. Time Complexity in Big-O notation
@@ -68,52 +50,51 @@ Code:
 ${code}
 \`\`\`
 
-Please respond in this exact format:
+Respond in exactly this format:
 Time Complexity: O(...)
 Space Complexity: O(...)
-Explanation: [Brief explanation]`;
+Explanation: ...`;
 
-      const result = await model.generateContent(prompt);
-      const text = result.response.text();
+      // --- REST API CALL ---
+      const responseAI = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+          }),
+        }
+      );
+
+      const data = await responseAI.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
       const timeMatch = text.match(/Time Complexity:\s*(O\([^)]+\))/i);
       const spaceMatch = text.match(/Space Complexity:\s*(O\([^)]+\))/i);
       const explMatch = text.match(/Explanation:\s*(.+)/i);
 
-      const timeComplexity = timeMatch ? timeMatch[1] : "O(?)";
-      const spaceComplexity = spaceMatch ? spaceMatch[1] : "O(?)";
-      const explanation = explMatch ? explMatch[1].trim() : "Analysis completed using AI.";
+      const result: AnalysisResult = {
+        linesOfCode,
+        timeComplexity: timeMatch ? timeMatch[1] : "O(?)",
+        spaceComplexity: spaceMatch ? spaceMatch[1] : "O(?)",
+        explanation: explMatch ? explMatch[1].trim() : "Analysis completed using AI.",
+      };
 
       await storage.createAnalysis({
         code,
         language,
         linesOfCode,
-        timeComplexity,
-        spaceComplexity,
-        explanation,
+        timeComplexity: result.timeComplexity,
+        spaceComplexity: result.spaceComplexity,
+        explanation: result.explanation,
       });
 
-      const response: AnalysisResult = {
-        linesOfCode,
-        timeComplexity,
-       spaceComplexity,
-        explanation,
-      };
+      res.json(result);
 
-      res.json(response);
-    } catch (error) {
-      console.error("Analysis error:", error);
-
-      const message = error instanceof Error ? error.message : "";
-      if (message.includes("quota") || message.includes("rate")) {
-        return res.status(429).json({
-          message: "API quota exceeded. Try again later."
-        });
-      }
-
-      return res.status(500).json({
-        message: "Failed to analyze code. Please try again."
-      });
+    } catch (err) {
+      console.error("Analysis error:", err);
+      return res.status(500).json({ message: "Failed to analyze. Try again." });
     }
   });
 
