@@ -9,7 +9,8 @@ const genAI = new GoogleGenerativeAI(
 );
 
 // cheaper model = flash-lite
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+   const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
 // simple in-memory rate limiter
 let lastAnalysisAt = 0;
