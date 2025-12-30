@@ -76,7 +76,7 @@ ${code}
 
       const data = await responseAI.json();
       let text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
+console.log("🔥 RAW GEMINI RESPONSE:", text);
       // normalize + parse JSON
       text = text.replace(/```json|```/g, "").trim();
       let parsed: any = {};
