@@ -3,9 +3,8 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { analyzeCodeSchema, type AnalysisResult } from "@shared/schema";
 
-let lastAnalysisAt = 0;
 const RATE_LIMIT_MS = 3000;
-const MODEL = "models/gemini-2.0-flash-lite-001";
+let lastAnalysisAt = 0;
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -14,12 +13,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const now = Date.now();
       if (now - lastAnalysisAt < RATE_LIMIT_MS) {
-        return res.status(429).json({ message: "Please wait before analyzing again." });
+        return res.status(429).json({ message: "Slow down 😅 Wait a few seconds." });
       }
       lastAnalysisAt = now;
 
       const { code, language } = analyzeCodeSchema.parse(req.body);
-      if (!apiKey) return res.status(400).json({ message: "API key missing" });
+      if (!apiKey) return res.status(400).json({ message: "Gemini API key missing ⚠️" });
 
       const existing = await storage.findByCode?.(code);
       if (existing) {
@@ -33,13 +32,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const linesOfCode = code
         .split("\n")
-        .filter((line) => {
-          const t = line.trim();
-          return t && !t.startsWith("//") && !t.startsWith("#") && !t.startsWith("/*") && !t.startsWith("*") && !t.startsWith("*/");
+        .filter(line => {
+          const trimmed = line.trim();
+          return trimmed && !trimmed.startsWith("//") && !trimmed.startsWith("#");
         }).length;
 
-      // strict JSON prompt (forces Gemini to reply JSON)
-      const prompt = `Analyze the following ${language} code and ONLY return JSON:
+      const prompt = `
+Analyze the following ${language} code and ONLY return JSON in this exact format:
+
 {
   "timeComplexity": "O(...)",
   "spaceComplexity": "O(...)",
@@ -49,82 +49,60 @@ export async function registerRoutes(app: Express): Promise<Server> {
 Code:
 \`\`\`${language}
 ${code}
-\`\`\``;
+\`\`\`
+`;
 
-const responseAI = await fetch(
-  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-001:generateContent?key=${apiKey}`,
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-001:generateContent?key=${apiKey}`,
         {
-          role: "user",
-          parts: [{ text: prompt }]
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-client": "genai-js/1.0.0"
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }]
+              }
+            ]
+          })
         }
-      ],
-      generationConfig: {
-        responseMimeType: "application/json"
-      }
-    })
-  }
-);
+      );
 
+      const json = await response.json();
+      console.log("🔥 RAW GEMINI RESPONSE:", json);
 
-      const data = await responseAI.json();
-      let text: string = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      console.log("🔥 RAW GEMINI RESPONSE:", text);
-
-      text = text.replace(/```json|```/g, "").trim();
-
-      let parsed: any = {};
-      try { parsed = JSON.parse(text); } catch { parsed = {}; }
-
-      let timeComplexity =
-        parsed.timeComplexity ??
-        (text.match(/Time Complexity:\s*(O\([^)]+\))/i)?.[1] ?? "O(?)");
-
-      let spaceComplexity =
-        parsed.spaceComplexity ??
-        (text.match(/Space Complexity:\s*(O\([^)]+\))/i)?.[1] ?? "O(?)");
-
-      let explanation =
-        parsed.explanation ??
-        (text.match(/Explanation:\s*(.+)/i)?.[1] ?? "AI analysis unavailable");
-
-      await storage.createAnalysis({
-        code,
-        language,
-        linesOfCode,
-        timeComplexity,
-        spaceComplexity,
-        explanation,
-      });
+      const text = json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      let parsed = {};
+      try {
+        parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      } catch {}
 
       const result: AnalysisResult = {
         linesOfCode,
-        timeComplexity,
-        spaceComplexity,
-        explanation
+        timeComplexity: parsed.timeComplexity ?? "O(?)",
+        spaceComplexity: parsed.spaceComplexity ?? "O(?)",
+        explanation: parsed.explanation ?? "AI could not analyze this code."
       };
 
-      res.json(result);
+      await storage.createAnalysis({ code, language, ...result });
+      return res.json(result);
 
     } catch (err) {
-      console.error("Analysis error:", err);
-      res.status(500).json({ message: "Failed to analyze" });
+      console.error("🔥 SERVER ERROR:", err);
+      res.status(500).json({ message: "Server crashed analyzing code 😭" });
     }
   });
 
-  app.get("/api/analyses", async (_req, res) => {
+  app.get("/api/analyses", async (_, res) => {
     try {
-      const list = await storage.getRecentAnalyses(10);
-      res.json(list);
+      res.json(await storage.getRecentAnalyses(10));
     } catch {
-      res.status(500).json({ message: "Failed to fetch analyses" });
+      res.status(500).json({ message: "Failed fetching history" });
     }
   });
 
-  const httpServer = createServer(app);
-  return httpServer;
+  return createServer(app);
 }
