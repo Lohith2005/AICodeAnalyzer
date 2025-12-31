@@ -5,6 +5,7 @@ import { analyzeCodeSchema, type AnalysisResult } from "@shared/schema";
 
 let lastAnalysisAt = 0;
 const RATE_LIMIT_MS = 3000;
+const MODEL = "models/gemini-2.0-flash-lite-001";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -20,7 +21,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { code, language } = analyzeCodeSchema.parse(req.body);
       if (!apiKey) return res.status(400).json({ message: "API key missing" });
 
-      // check cache
       const existing = await storage.findByCode?.(code);
       if (existing) {
         return res.json({
@@ -31,24 +31,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      // count code lines
       const linesOfCode = code
         .split("\n")
         .filter((line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return false;
-          if (trimmed.startsWith("//")) return false;
-          if (trimmed.startsWith("#")) return false;
-          if (trimmed.startsWith("/*")) return false;
-          if (trimmed.startsWith("*")) return false;
-          if (trimmed.startsWith("*/")) return false;
-          return true;
+          const t = line.trim();
+          return t && !t.startsWith("//") && !t.startsWith("#") && !t.startsWith("/*") && !t.startsWith("*") && !t.startsWith("*/");
         }).length;
 
-      // strict JSON prompt
-      const prompt = `Analyze the following ${language} code and ONLY return JSON.
-
-Example Format:
+      // strict JSON prompt (forces Gemini to reply JSON)
+      const prompt = `Analyze the following ${language} code and ONLY return JSON:
 {
   "timeComplexity": "O(...)",
   "spaceComplexity": "O(...)",
@@ -60,41 +51,38 @@ Code:
 ${code}
 \`\`\``;
 
-      // REST CALL (NEW MODELS + ROLE REQUIRED)
       const responseAI = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-001:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${apiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: prompt }]
-              }
-            ]
+            contents: [{ role: "user", parts: [{ text: prompt }] }]
           })
         }
       );
 
       const data = await responseAI.json();
-      let text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      let text: string = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       console.log("🔥 RAW GEMINI RESPONSE:", text);
 
-      // clean + parse json
       text = text.replace(/```json|```/g, "").trim();
+
       let parsed: any = {};
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = {};
-      }
+      try { parsed = JSON.parse(text); } catch { parsed = {}; }
 
-      const timeComplexity = parsed.timeComplexity ?? "O(?)";
-      const spaceComplexity = parsed.spaceComplexity ?? "O(?)";
-      const explanation = parsed.explanation ?? "Analysis unavailable";
+      let timeComplexity =
+        parsed.timeComplexity ??
+        (text.match(/Time Complexity:\s*(O\([^)]+\))/i)?.[1] ?? "O(?)");
 
-      // save to DB
+      let spaceComplexity =
+        parsed.spaceComplexity ??
+        (text.match(/Space Complexity:\s*(O\([^)]+\))/i)?.[1] ?? "O(?)");
+
+      let explanation =
+        parsed.explanation ??
+        (text.match(/Explanation:\s*(.+)/i)?.[1] ?? "AI analysis unavailable");
+
       await storage.createAnalysis({
         code,
         language,
@@ -108,7 +96,7 @@ ${code}
         linesOfCode,
         timeComplexity,
         spaceComplexity,
-        explanation,
+        explanation
       };
 
       res.json(result);
@@ -119,7 +107,6 @@ ${code}
     }
   });
 
-  // recent history
   app.get("/api/analyses", async (_req, res) => {
     try {
       const list = await storage.getRecentAnalyses(10);
